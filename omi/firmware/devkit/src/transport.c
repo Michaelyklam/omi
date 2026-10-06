@@ -14,6 +14,7 @@
 #include <zephyr/sys/ring_buffer.h>
 
 #include "config.h"
+#include "diagnostics.h"
 #include "utils.h"
 // #include "nfc.h"
 #include "button.h"
@@ -283,6 +284,12 @@ static const struct bt_data bt_sd[] = {
 
 static void audio_ccc_config_changed_handler(const struct bt_gatt_attr *attr, uint16_t value)
 {
+    /* The speaker characteristic shares this handler, but must not change
+     * whether microphone audio is expected by the client.
+     */
+    if (attr == &audio_service.attrs[3]) {
+        diagnostics_subscription(value == BT_GATT_CCC_NOTIFY);
+    }
     if (value == BT_GATT_CCC_NOTIFY) {
         LOG_INF("Client subscribed for notifications");
     } else if (value == 0) {
@@ -382,6 +389,8 @@ void broadcast_battery_level(struct k_work *work_item)
     if (battery_get_millivolt(&battery_millivolt) == 0 &&
         battery_get_percentage(&battery_percentage, battery_millivolt) == 0) {
 
+        diagnostics_battery(battery_millivolt);
+
         LOG_PRINTK("Battery at %d mV (capacity %d%%)\n", battery_millivolt, battery_percentage);
 
         // Use the Zephyr BAS function to set (and notify) the battery level
@@ -403,6 +412,11 @@ void broadcast_battery_level(struct k_work *work_item)
 static void _transport_connected(struct bt_conn *conn, uint8_t err)
 {
     struct bt_conn_info info = {0};
+    if (err) {
+        LOG_WRN("Transport connection failed: HCI status=0x%02x", err);
+        diagnostics_connection(false, err);
+        return;
+    }
     storage_is_on = true;
 
     err = bt_conn_get_info(conn, &info);
@@ -431,6 +445,7 @@ static void _transport_connected(struct bt_conn *conn, uint8_t err)
     k_work_schedule(&battery_work, K_MSEC(100)); // run immediately
 
     is_connected = true;
+    diagnostics_connection(true, 0);
     atomic_inc(&connection_generation);
     k_sem_give(&pusher_wake_sem);
 }
@@ -440,7 +455,8 @@ static void _transport_disconnected(struct bt_conn *conn, uint8_t err)
     is_connected = false;
     storage_is_on = false;
 
-    LOG_INF("Transport disconnected");
+    LOG_INF("Transport disconnected: HCI reason=0x%02x", err);
+    diagnostics_connection(false, err);
 
     if (current_connection != NULL) {
         bt_conn_unref(current_connection);
@@ -526,6 +542,7 @@ static bool write_to_tx_queue(uint8_t *data, size_t size)
     if (written != CODEC_OUTPUT_MAX_BYTES + RING_BUFFER_HEADER_SIZE) {
         return false;
     } else {
+        diagnostics_progress(STREAM_QUEUE);
         k_sem_give(&pusher_wake_sem);
         return true;
     }
@@ -594,6 +611,7 @@ static bool push_to_gatt(struct bt_conn *conn)
                 bt_gatt_notify(conn, &audio_service.attrs[1], pusher_temp_data, packet_size + NET_BUFFER_HEADER_SIZE);
 
             if (err) {
+                diagnostics_error(STREAM_BLE, err);
                 LOG_DBG("bt_gatt_notify failed (err %d)", err);
                 LOG_DBG("MTU: %d, packet_size: %d", current_mtu, packet_size + NET_BUFFER_HEADER_SIZE);
                 k_sleep(K_MSEC(1));
@@ -601,6 +619,8 @@ static bool push_to_gatt(struct bt_conn *conn)
                 continue;
             }
 
+            /* Accepted by the local BLE stack; this is not a phone receipt ACK. */
+            diagnostics_progress(STREAM_BLE);
             break;
         }
 
@@ -798,6 +818,7 @@ int bt_off()
 
     // Ensure all Bluetooth resources are cleaned up
     is_connected = false;
+    diagnostics_connection(false, BT_HCI_ERR_LOCALHOST_TERM_CONN);
     storage_is_on = false;
     current_mtu = 0;
     k_sem_give(&pusher_wake_sem);
@@ -895,6 +916,7 @@ int broadcast_audio_packets(uint8_t *buffer, size_t size)
     }
 
     if (retry_count >= max_retries) {
+        diagnostics_error(STREAM_QUEUE, -ENOBUFS);
         LOG_ERR("Failed to write to tx queue after %d retries", max_retries);
         return -1;
     }

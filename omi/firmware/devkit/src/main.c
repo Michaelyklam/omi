@@ -5,6 +5,7 @@
 #include "button.h"
 #include "codec.h"
 #include "config.h"
+#include "diagnostics.h"
 #include "led.h"
 #include "mic.h"
 #include "sdcard.h"
@@ -22,6 +23,11 @@ LOG_MODULE_REGISTER(main, CONFIG_LOG_DEFAULT_LEVEL);
 
 static void codec_handler(uint8_t *data, size_t len)
 {
+    if (len == 0) {
+        diagnostics_error(STREAM_CODEC, -EIO);
+        return;
+    }
+    diagnostics_progress(STREAM_CODEC);
     int err = broadcast_audio_packets(data, len);
     if (err) {
         LOG_ERR("Failed to broadcast audio packets: %d", err);
@@ -30,20 +36,24 @@ static void codec_handler(uint8_t *data, size_t len)
 
 static void mic_handler(int16_t *buffer)
 {
+    diagnostics_progress(STREAM_MIC);
     int err = codec_receive_pcm(buffer, MIC_BUFFER_SAMPLES);
     if (err) {
+        diagnostics_error(STREAM_CODEC, err);
         LOG_ERR("Failed to process PCM data: %d", err);
     }
 }
 
 void bt_ctlr_assert_handle(char *name, int type)
 {
+    diagnostics_error(STREAM_BLE, -EFAULT);
     LOG_INF("Bluetooth assert: %s (type %d)", name ? name : "NULL", type);
 }
 
 static void print_reset_reason(void)
 {
     uint32_t reas = NRF_POWER->RESETREAS;
+    diagnostics_init(reas);
 
     // Clear the reset reason register
     NRF_POWER->RESETREAS = reas;
@@ -116,14 +126,14 @@ void set_led_state()
         set_led_blue(false);
         return;
     }
-    if (is_connected) {
+    if (is_connected && !diagnostics_has_fault()) {
         set_led_blue(true);
         set_led_red(false);
         return;
     }
 
     // Recording but lost connection - RED
-    if (!is_connected) {
+    if (!is_connected || diagnostics_has_fault()) {
         set_led_red(true);
         set_led_blue(false);
         return;
@@ -357,6 +367,7 @@ int main(void)
     while (1) {
         watchdog_feed();
 
+        diagnostics_poll(!is_off);
         set_led_state();
         k_msleep(500);
     }

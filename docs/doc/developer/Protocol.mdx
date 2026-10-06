@@ -90,6 +90,28 @@ This is the main service for streaming audio from the device to the app.
 
 ---
 
+## Devkit stream health diagnostics
+
+Devkit builds containing the stream health monitor expose an additional read-only
+service at `c7c70000-6e8d-4c34-b792-b7d0f7c3a981`. Read the 320-byte snapshot at
+`c7c70001-6e8d-4c34-b792-b7d0f7c3a981` to inspect microphone, encoder, queue, and
+BLE enqueue progress, recent errors, HCI reason codes, and the boot reset reason.
+This service is optional: discover it before reading; existing releases may not
+provide it. The audio service and packet format above are unchanged.
+
+The snapshot has `OMID` magic and schema version 1 and uses little-endian values.
+The [wire layout and collector instructions](https://github.com/BasedHardware/omi/blob/main/omi/firmware/devkit/STREAM_DIAGNOSTICS.md)
+describe all fields. Event history is held in RAM and does not survive a reset.
+Save snapshots or USB console output on the receiver to retain evidence across
+resets. No audio content is included in diagnostics.
+
+The monitor flags five seconds without progress only while microphone audio is
+subscribed and capture is expected. Successful BLE enqueue is not proof that the
+phone received a notification. A test receiver must track its own notification
+arrival times to distinguish device-side progress from app-side receipt.
+
+---
+
 ## Codec Types
 
 The codec type characteristic determines how to decode the audio data:
