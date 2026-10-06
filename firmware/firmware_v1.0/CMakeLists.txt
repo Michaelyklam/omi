@@ -10,6 +10,7 @@ target_sources(app PRIVATE
     src/transport.c
     src/stream_health.c
     src/diagnostics.c
+    src/field_journal.c
     src/mic.c
     src/led.c
     src/audio.c
