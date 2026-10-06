@@ -10,6 +10,7 @@
 #include <zephyr/drivers/gpio.h>
 #include "transport.h"
 #include "config.h"
+#include "diagnostics.h"
 #include "utils.h"
 #include "btutils.h"
 #include "lib/battery/battery.h"
@@ -89,6 +90,7 @@ uint16_t current_package_index = 0;
 
 static void audio_ccc_config_changed_handler(const struct bt_gatt_attr *attr, uint16_t value)
 {
+    diagnostics_subscription(value == BT_GATT_CCC_NOTIFY);
     if (value == BT_GATT_CCC_NOTIFY)
     {
         printk("Client subscribed for notifications\n");
@@ -174,6 +176,7 @@ void broadcast_battery_level(struct k_work *work_item) {
 
         printk("Battery at %d mV (capacity %d%%)\n", battery_millivolt, battery_percentage);
 
+        diagnostics_battery(battery_millivolt);
         // Use the Zephyr BAS function to set (and notify) the battery level
         int err = bt_bas_set_battery_level(battery_percentage);
         if (err) {
@@ -193,6 +196,7 @@ void broadcast_battery_level(struct k_work *work_item) {
 static void _transport_connected(struct bt_conn *conn, uint8_t err)
 {
     struct bt_conn_info info = {0};
+    if (err) { diagnostics_connection(false, err); return; }
 
     err = bt_conn_get_info(conn, &info);
     if (err)
@@ -211,13 +215,15 @@ static void _transport_connected(struct bt_conn *conn, uint8_t err)
     k_work_schedule(&battery_work, K_MSEC(BATTERY_REFRESH_INTERVAL));
 
     is_connected = true;
+    diagnostics_connection(true, 0);
 }
 
 static void _transport_disconnected(struct bt_conn *conn, uint8_t err)
 {
     is_connected = false;
 
-    printk("Disconnected\n");
+    printk("Disconnected: HCI reason=0x%02x\n", err);
+    diagnostics_connection(false, err);
     bt_conn_unref(conn);
     current_connection = NULL;
     current_mtu = 0;
@@ -299,6 +305,7 @@ static bool write_to_tx_queue(uint8_t *data, size_t size)
     }
     else
     {
+        diagnostics_progress(STREAM_QUEUE);
         return true;
     }
 }
@@ -363,6 +370,7 @@ static bool push_to_gatt(struct bt_conn *conn)
             // Log failure
             if (err)
             {
+                diagnostics_error(STREAM_BLE, err);
                 printk("bt_gatt_notify failed (err %d)\n", err);
                 printk("MTU: %d, packet_size: %d\n", current_mtu, packet_size + NET_BUFFER_HEADER_SIZE);
                 k_sleep(K_MSEC(1));
@@ -374,6 +382,7 @@ static bool push_to_gatt(struct bt_conn *conn)
                 continue;
             }
 
+            if (err == 0) { diagnostics_progress(STREAM_BLE); }
             // Break if success
             break;
         }
@@ -497,6 +506,7 @@ int broadcast_audio_packets(uint8_t *buffer, size_t size)
 {
     while (!write_to_tx_queue(buffer, size))
     {
+        diagnostics_error(STREAM_QUEUE, -ENOBUFS);
         k_sleep(K_MSEC(1));
     }
     return 0;
