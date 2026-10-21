@@ -56,3 +56,9 @@ microphone/encoder progress, and recovery. Download journal records and compare
 microphone, codec, queue, BLE and host sequence counters. Restore and verify the
 normal `field.conf` image after testing. The normal image does not link the
 wrapper or enable the injection option.
+
+The laboratory image also accepts one byte `0x07` on the existing DFU control
+point to return to USB UF2 (`GPREGRET=0x57`, per the Adafruit nRF52 bootloader).
+This lets the normal image be restored after the experiment. Both the wrapper
+and this laboratory command are excluded when LISTENER_QUEUE_FAULT_TEST is OFF.
+The existing `0x06` OTA command is unchanged.

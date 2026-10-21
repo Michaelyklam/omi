@@ -171,6 +171,7 @@ set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -DHAVE_LRINT -DHAVE_LRINTF")
 # Explicit laboratory image only; never enabled in field.conf.
 option(LISTENER_QUEUE_FAULT_TEST "Inject 3s and 8s sender stalls for hardware validation" OFF)
 if(LISTENER_QUEUE_FAULT_TEST)
+    target_compile_definitions(app PRIVATE LISTENER_QUEUE_FAULT_TEST=1)
     target_sources(app PRIVATE tests/transport_fault_injection.c)
     zephyr_link_libraries(-Wl,--wrap=bt_gatt_notify_cb)
 endif()

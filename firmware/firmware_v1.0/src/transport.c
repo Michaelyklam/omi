@@ -156,6 +156,15 @@ static void dfu_ccc_config_changed_handler(const struct bt_gatt_attr *attr, uint
 static ssize_t dfu_control_point_write_handler(struct bt_conn *conn, const struct bt_gatt_attr *attr, const void *buf, uint16_t len, uint16_t offset, uint8_t flags)
 {
     printk("dfu_control_point_write_handler\n");
+#ifdef LISTENER_QUEUE_FAULT_TEST
+    /* Laboratory image only: return to USB UF2 for restoring the normal image.
+     * Adafruit bootloader UF2 magic; the existing OTA command stays unchanged. */
+    if (len == 1 && ((uint8_t *)buf)[0] == 0x07) {
+        NRF_POWER->GPREGRET = 0x57;
+        NVIC_SystemReset();
+        return len;
+    }
+#endif
     if (len == 1 && ((uint8_t *)buf)[0] == 0x06)
     {
         NRF_POWER->GPREGRET = 0xA8;
