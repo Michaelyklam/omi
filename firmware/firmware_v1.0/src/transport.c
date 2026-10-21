@@ -1,6 +1,6 @@
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
-#include <zephyr/sys/ring_buffer.h>
+#include "audio_queue.h"
 #include <zephyr/bluetooth/bluetooth.h>
 #include <zephyr/bluetooth/uuid.h>
 #include <zephyr/bluetooth/gatt.h>
@@ -86,10 +86,25 @@ static const struct bt_data bt_sd[] = {
 
 struct bt_conn *current_connection = NULL;
 uint16_t current_mtu = 0;
-uint16_t current_package_index = 0;
+/* Connection ownership, subscription generation, and queue share one lock.
+ * Never call the Bluetooth stack or diagnostics with this lock held. */
+static struct k_spinlock tx_lock;
+static struct audio_queue tx_queue;
+static bool audio_subscribed;
+static uint32_t tx_generation;
+static uint16_t next_sequence;
+K_SEM_DEFINE(tx_wake, 0, 1);
+K_SEM_DEFINE(tx_ready, 0, 1);
 
 static void audio_ccc_config_changed_handler(const struct bt_gatt_attr *attr, uint16_t value)
 {
+    k_spinlock_key_t key = k_spin_lock(&tx_lock);
+    audio_subscribed = value == BT_GATT_CCC_NOTIFY;
+    ++tx_generation;
+    audio_queue_reset(&tx_queue);
+    k_spin_unlock(&tx_lock, key);
+    k_sem_give(&tx_wake);
+    k_sem_give(&tx_ready);
     diagnostics_subscription(value == BT_GATT_CCC_NOTIFY);
     if (value == BT_GATT_CCC_NOTIFY)
     {
@@ -205,8 +220,14 @@ static void _transport_connected(struct bt_conn *conn, uint8_t err)
         return;
     }
 
-    current_connection = bt_conn_ref(conn);
+    struct bt_conn *owned = bt_conn_ref(conn);
+    k_spinlock_key_t key = k_spin_lock(&tx_lock);
+    current_connection = owned;
     current_mtu = info.le.data_len->tx_max_len;
+    audio_subscribed = false;
+    ++tx_generation;
+    audio_queue_reset(&tx_queue);
+    k_spin_unlock(&tx_lock, key);
     printk("Connected\n");
     printk("Interval: %d, latency: %d, timeout: %d\n", info.le.interval, info.le.latency, info.le.timeout);
     printk("TX PHY %s, RX PHY %s\n", phy2str(info.le.phy->tx_phy), phy2str(info.le.phy->rx_phy));
@@ -224,9 +245,17 @@ static void _transport_disconnected(struct bt_conn *conn, uint8_t err)
 
     printk("Disconnected: HCI reason=0x%02x\n", err);
     diagnostics_connection(false, err);
-    bt_conn_unref(conn);
+    k_spinlock_key_t key = k_spin_lock(&tx_lock);
+    struct bt_conn *owned = current_connection;
     current_connection = NULL;
     current_mtu = 0;
+    audio_subscribed = false;
+    ++tx_generation;
+    audio_queue_reset(&tx_queue);
+    k_spin_unlock(&tx_lock, key);
+    if (owned) bt_conn_unref(owned);
+    k_sem_give(&tx_wake);
+    k_sem_give(&tx_ready);
 }
 
 static bool _le_param_req(struct bt_conn *conn, struct bt_le_conn_param *param)
@@ -261,7 +290,9 @@ static void _le_data_length_updated(struct bt_conn *conn,
            " RX (len: %d time: %d)\n",
            info->tx_max_len,
            info->tx_max_time, info->rx_max_len, info->rx_max_time);
+    k_spinlock_key_t key = k_spin_lock(&tx_lock);
     current_mtu = info->tx_max_len;
+    k_spin_unlock(&tx_lock, key);
 }
 
 static struct bt_conn_cb _callback_references = {
@@ -273,172 +304,75 @@ static struct bt_conn_cb _callback_references = {
     .le_data_len_updated = _le_data_length_updated,
 };
 
-//
-// Ring Buffer
-//
-
+/* The codec only enqueues complete encoded frames; Bluetooth backpressure
+ * must never block it and cause the microphone PCM ring to overflow. */
 #define NET_BUFFER_HEADER_SIZE 3
-#define RING_BUFFER_HEADER_SIZE 2
-static uint8_t tx_queue[NETWORK_RING_BUF_SIZE * (CODEC_OUTPUT_MAX_BYTES + RING_BUFFER_HEADER_SIZE)];
-static uint8_t tx_buffer[CODEC_OUTPUT_MAX_BYTES + RING_BUFFER_HEADER_SIZE];
-static uint8_t tx_buffer_2[CODEC_OUTPUT_MAX_BYTES + RING_BUFFER_HEADER_SIZE];
-static uint32_t tx_buffer_size = 0;
-static struct ring_buf ring_buf;
-
-static bool write_to_tx_queue(uint8_t *data, size_t size)
-{
-    if (size > CODEC_OUTPUT_MAX_BYTES)
-    {
-        return false;
-    }
-
-    // Copy data (TODO: Avoid this copy)
-    tx_buffer_2[0] = size & 0xFF;
-    tx_buffer_2[1] = (size >> 8) & 0xFF;
-    memcpy(tx_buffer_2 + RING_BUFFER_HEADER_SIZE, data, size);
-
-    // Write to ring buffer
-    int written = ring_buf_put(&ring_buf, tx_buffer_2, (CODEC_OUTPUT_MAX_BYTES + RING_BUFFER_HEADER_SIZE)); // It always fits completely or not at all
-    if (written != CODEC_OUTPUT_MAX_BYTES + RING_BUFFER_HEADER_SIZE)
-    {
-        return false;
-    }
-    else
-    {
-        diagnostics_progress(STREAM_QUEUE);
-        return true;
-    }
-}
-
-static bool read_from_tx_queue()
-{
-
-    // Read from ring buffer
-    // memset(tx_buffer, 0, sizeof(tx_buffer));
-    tx_buffer_size = ring_buf_get(&ring_buf, tx_buffer, (CODEC_OUTPUT_MAX_BYTES + RING_BUFFER_HEADER_SIZE)); // It always fits completely or not at all
-    if (tx_buffer_size != (CODEC_OUTPUT_MAX_BYTES + RING_BUFFER_HEADER_SIZE))
-    {
-        /* An empty audio queue is normal; faults are captured separately. */
-        return false;
-    }
-
-    // Adjust size
-    tx_buffer_size = tx_buffer[0] + (tx_buffer[1] << 8);
-
-    return true;
-}
-
-//
-// Pusher
-//
-
-// Thread
-K_THREAD_STACK_DEFINE(pusher_stack, 1024);
+K_THREAD_STACK_DEFINE(pusher_stack, 2048);
 static struct k_thread pusher_thread;
-static uint16_t packet_next_index = 0;
-static uint8_t pusher_temp_data[CODEC_OUTPUT_MAX_BYTES + NET_BUFFER_HEADER_SIZE];
+static struct audio_frame pending_frame;
+static uint8_t notification[AUDIO_TX_FRAME_MAX + NET_BUFFER_HEADER_SIZE];
 
-static bool push_to_gatt(struct bt_conn *conn)
+static bool same_session(struct bt_conn *conn, uint32_t generation)
 {
-    // Read data from ring buffer
-    if (!read_from_tx_queue())
-    {
-        return false;
-    }
+    k_spinlock_key_t key = k_spin_lock(&tx_lock);
+    bool valid = current_connection == conn && audio_subscribed && tx_generation == generation;
+    k_spin_unlock(&tx_lock, key);
+    return valid;
+}
 
-    // Push each frame
-    uint8_t *buffer = tx_buffer + RING_BUFFER_HEADER_SIZE;
-    uint32_t offset = 0;
-    uint8_t index = 0;
-    while (offset < tx_buffer_size)
-    {
-        // Recombine packet
-        uint32_t id = packet_next_index++;
-        uint32_t packet_size = MIN(current_mtu - NET_BUFFER_HEADER_SIZE, tx_buffer_size - offset);
-        pusher_temp_data[0] = id & 0xFF;
-        pusher_temp_data[1] = (id >> 8) & 0xFF;
-        pusher_temp_data[2] = index;
-        memcpy(pusher_temp_data + NET_BUFFER_HEADER_SIZE, buffer + offset, packet_size);
-        offset += packet_size;
-        index++;
-
-        while (true)
-        {
-            // Try send notification
-            int err = bt_gatt_notify(conn, &audio_service.attrs[1], pusher_temp_data, packet_size + NET_BUFFER_HEADER_SIZE);
-
-            // Log failure
-            if (err)
-            {
-                diagnostics_error(STREAM_BLE, err);
-                printk("bt_gatt_notify failed (err %d)\n", err);
-                printk("MTU: %d, packet_size: %d\n", current_mtu, packet_size + NET_BUFFER_HEADER_SIZE);
-                k_sleep(K_MSEC(1));
-            }
-
-            // Try to send more data if possible
-            if (err == -EAGAIN || err == -ENOMEM)
-            {
-                continue;
-            }
-
-            if (err == 0) { diagnostics_progress(STREAM_BLE); }
-            // Break if success
-            break;
-        }
-    }
-
-    return true;
+static void notification_complete(struct bt_conn *conn, void *user_data)
+{
+    ARG_UNUSED(conn);
+    ARG_UNUSED(user_data);
+    k_sem_give(&tx_ready);
 }
 
 void pusher(void)
 {
-    while (1)
-    {
+    while (1) {
+        k_sem_take(&tx_wake, K_FOREVER);
+        while (1) {
+            k_spinlock_key_t key = k_spin_lock(&tx_lock);
+            struct bt_conn *conn = current_connection;
+            uint32_t generation = tx_generation;
+            bool available = conn && audio_subscribed && audio_queue_get(&tx_queue, &pending_frame);
+            if (available) conn = bt_conn_ref(conn);
+            k_spin_unlock(&tx_lock, key);
+            if (!available) break;
 
-        //
-        // Load current connection
-        //
-
-        struct bt_conn *conn = current_connection;
-        bool use_gatt = true;
-        if (conn)
-        {
-            conn = bt_conn_ref(conn);
-        }
-        bool valid = true;
-        if (current_mtu < MINIMAL_PACKET_SIZE)
-        {
-            valid = false;
-        }
-        else if (!conn)
-        {
-            valid = false;
-        }
-        else
-        {
-            valid = bt_gatt_is_subscribed(conn, &audio_service.attrs[1], BT_GATT_CCC_NOTIFY); // Check if subscribed
-        }
-
-        // If no valid mode exists - discard whole buffer
-        if (!valid)
-        {
-            ring_buf_reset(&ring_buf);
-            k_sleep(K_MSEC(10));
-        }
-
-        // Handle GATT
-        if (use_gatt && valid)
-        {
-            bool sent = push_to_gatt(conn);
-            if (!sent)
-            {
-                k_sleep(K_MSEC(50));
+            /* Each live app notification must contain one complete Opus frame.
+             * Link data length is not the ATT MTU. Never silently fragment an
+             * Opus packet the app cannot reassemble. */
+            size_t capacity = bt_gatt_get_mtu(conn) - 3U;
+            if (pending_frame.size + NET_BUFFER_HEADER_SIZE > capacity) {
+                diagnostics_error(STREAM_BLE, -EMSGSIZE);
+                bt_conn_unref(conn);
+                continue;
             }
-        }
-
-        if (conn)
-        {
+            notification[0] = pending_frame.sequence & 255;
+            notification[1] = pending_frame.sequence >> 8;
+            notification[2] = 0;
+            memcpy(notification + NET_BUFFER_HEADER_SIZE, pending_frame.data, pending_frame.size);
+            struct bt_gatt_notify_params params = {
+                .attr = &audio_service.attrs[1],
+                .data = notification,
+                .len = pending_frame.size + NET_BUFFER_HEADER_SIZE,
+                .func = notification_complete,
+            };
+            while (same_session(conn, generation)) {
+                int err = bt_gatt_notify_cb(conn, &params);
+                if (!err) {
+                    diagnostics_progress(STREAM_BLE);
+                    break;
+                }
+                if (err != -EAGAIN && err != -ENOMEM) {
+                    diagnostics_error(STREAM_BLE, err);
+                    break;
+                }
+                /* Resource pressure is a retry, not a lost frame. Keep this
+                 * frame and sequence until accepted or the session ends. */
+                k_sem_take(&tx_ready, K_MSEC(10));
+            }
             bt_conn_unref(conn);
         }
     }
@@ -491,23 +425,35 @@ int transport_start()
 	}
 
     // Start pusher
-    ring_buf_init(&ring_buf, sizeof(tx_queue), tx_queue);
+    audio_queue_reset(&tx_queue);
     k_thread_create(&pusher_thread, pusher_stack, K_THREAD_STACK_SIZEOF(pusher_stack), (k_thread_entry_t)pusher, NULL, NULL, NULL, K_PRIO_PREEMPT(7), 0, K_NO_WAIT);
 
     return 0;
 }
 
-struct bt_conn *get_current_connection()
-{
-    return current_connection;
-}
-
 int broadcast_audio_packets(uint8_t *buffer, size_t size)
 {
-    while (!write_to_tx_queue(buffer, size))
-    {
-        diagnostics_error(STREAM_QUEUE, -ENOBUFS);
-        k_sleep(K_MSEC(1));
+    if (!size || size > AUDIO_TX_FRAME_MAX) {
+        diagnostics_error(STREAM_QUEUE, -EMSGSIZE);
+        return -EMSGSIZE;
     }
+    k_spinlock_key_t key = k_spin_lock(&tx_lock);
+    bool active = current_connection && audio_subscribed;
+    /* Allocate the sequence before enqueue, so bounded queue overflow is
+     * visible in subsequent received packet IDs rather than hidden upstream. */
+    uint16_t sequence = next_sequence;
+    bool accepted = false;
+    if (active) {
+        ++next_sequence;
+        accepted = audio_queue_put(&tx_queue, buffer, size, sequence);
+    }
+    k_spin_unlock(&tx_lock, key);
+    if (!active) return 0;
+    if (!accepted) {
+        diagnostics_error(STREAM_QUEUE, -ENOBUFS);
+        return -ENOBUFS;
+    }
+    diagnostics_progress(STREAM_QUEUE);
+    k_sem_give(&tx_wake);
     return 0;
 }

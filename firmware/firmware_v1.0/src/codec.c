@@ -24,15 +24,20 @@ void set_codec_callback(codec_callback callback)
 
 uint8_t codec_ring_buffer_data[AUDIO_BUFFER_SAMPLES * 2]; // 2 bytes per sample
 struct ring_buf codec_ring_buf;
+K_SEM_DEFINE(codec_ready, 0, 1);
 
 int codec_receive_pcm(int16_t *data, size_t len)
 {
+    if (ring_buf_space_get(&codec_ring_buf) < len * 2) {
+        return -1; /* Reject the entire PCM buffer; never splice partial audio. */
+    }
     int written = ring_buf_put(&codec_ring_buf, (uint8_t *)data, len * 2);
     if (written != len * 2)
     {
-        printk("Failed to write %d bytes to codec ring buffer\n", len * 2);
+
         return -1;
     }
+    k_sem_give(&codec_ready);
     return 0;
 }
 
@@ -67,7 +72,7 @@ void codec_entry()
         // Check if we have enough data
         if (ring_buf_size_get(&codec_ring_buf) < CODEC_PACKAGE_SAMPLES * 2)
         {
-            k_sleep(K_MSEC(10));
+            k_sem_take(&codec_ready, K_FOREVER);
             continue;
         }
 
