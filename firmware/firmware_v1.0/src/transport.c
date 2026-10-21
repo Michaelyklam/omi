@@ -87,7 +87,7 @@ static const struct bt_data bt_sd[] = {
 struct bt_conn *current_connection = NULL;
 uint16_t current_mtu = 0;
 /* Connection ownership, subscription generation, and queue share one lock.
- * Never call the Bluetooth stack or diagnostics with this lock held. */
+ * Never call Bluetooth send APIs or diagnostics with this lock held. */
 static struct k_spinlock tx_lock;
 static struct audio_queue tx_queue;
 static bool audio_subscribed;

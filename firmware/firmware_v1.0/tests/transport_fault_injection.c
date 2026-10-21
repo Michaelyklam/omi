@@ -3,9 +3,16 @@
  * Production links neither this wrapper nor its branches. */
 #include <zephyr/kernel.h>
 #include <zephyr/bluetooth/gatt.h>
+#include <zephyr/bluetooth/uuid.h>
 int __real_bt_gatt_notify_cb(struct bt_conn *, struct bt_gatt_notify_params *);
 int __wrap_bt_gatt_notify_cb(struct bt_conn *conn, struct bt_gatt_notify_params *params)
 {
+    static struct bt_uuid_128 audio_uuid = BT_UUID_INIT_128(
+        BT_UUID_128_ENCODE(0x19B10001, 0xE8F2, 0x537E, 0x4F6C, 0xD104768A1214));
+    if (bt_uuid_cmp(params->attr->uuid, BT_UUID_GATT_CHRC) ||
+        bt_uuid_cmp(((struct bt_gatt_chrc *)params->attr->user_data)->uuid, &audio_uuid.uuid)) {
+        return __real_bt_gatt_notify_cb(conn, params);
+    }
     static int64_t first_ms = -1;
     static bool was_blocked;
     int64_t now = k_uptime_get();
