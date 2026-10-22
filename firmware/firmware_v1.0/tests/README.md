@@ -62,3 +62,11 @@ point to return to USB UF2 (`GPREGRET=0x57`, per the Adafruit nRF52 bootloader).
 This lets the normal image be restored after the experiment. Both the wrapper
 and this laboratory command are excluded when LISTENER_QUEUE_FAULT_TEST is OFF.
 The existing `0x06` OTA command is unchanged.
+
+The October 21 hardware run also exposed a default three-buffer ATT/ACL send
+window on a Mac-selected 45 ms interval. That window could not keep 100 audio
+notifications/s moving. The fixed configuration provides 12 ATT and ACL TX
+credits. TX ACL payloads are 251 bytes to match link data length; the Bluetooth
+host fragments larger ATT PDUs, so the configured ATT MTU remains 498. This
+keeps RAM bounded while providing enough queued packets for catch-up. The
+updated laboratory image advertises `1.0.4-qt2`.
