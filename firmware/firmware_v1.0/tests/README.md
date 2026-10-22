@@ -24,7 +24,7 @@ cc -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined -g \
 /tmp/listener-audio-queue-test
 ```
 
-`field.conf` builds `1.0.4-queue1`: the encoder submits without waiting for
+`field.conf` builds `1.0.4-queue2`: the encoder submits without waiting for
 Bluetooth, a semaphore wakes the sender, and complete encoded frames occupy a
 24 KiB byte queue instead of 32 worst-case padded slots. It holds roughly five
 seconds at a measured 32 kbps; unconstrained VBR means this is not a fixed time
