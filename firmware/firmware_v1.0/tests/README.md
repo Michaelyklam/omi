@@ -70,3 +70,11 @@ credits. TX ACL payloads are 251 bytes to match link data length; the Bluetooth
 host fragments larger ATT PDUs, so the configured ATT MTU remains 498. This
 keeps RAM bounded while providing enough queued packets for catch-up. The
 updated laboratory image advertises `1.0.4-qt2`.
+
+Sustained validation also checks for growing queue backlog; zero error counters
+alone are insufficient. The sender now shares encoder priority 4, so the
+encoder's existing per-frame `k_yield()` can run the sender instead of holding
+it behind an entire PCM batch. Preferred link intervals are 15–30 ms with a
+4 s supervision timeout. Actual central negotiation must be logged and verified;
+these preferences do not guarantee a particular interval on all phones. The
+updated laboratory image is `1.0.4-qt3`. Battery impact is unmeasured.
